@@ -18,9 +18,14 @@ package network
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -68,35 +73,75 @@ func TestHTTPRoundTripper(t *testing.T) {
 	}
 }
 
-func TestDialWithBackoff(t *testing.T) {
-	// Nobody's listening on a random port. Usually.
-	c, err := DialWithBackOff(context.Background(), "tcp4", "127.0.0.1:41482")
-	if err == nil {
-		c.Close()
-		t.Error("Unexpected success dialing")
-	}
+//goland:noinspection HttpUrlsUsage
+const HTTPPrefix = "http://"
 
+func TestDialWithBackoff(t *testing.T) {
+	t.Run("ConnectionRefused", testDialWithBackoffConnectionRefused)
+	t.Run("Timeout", testDialWithBackoffTimeout)
+	t.Run("Success", testDialWithBackoffSuccess)
+}
+
+func testDialWithBackoffConnectionRefused(t *testing.T) {
+	port := findUnusedPortOrFail(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	c, err := DialWithBackOff(context.Background(), "tcp4", addr)
+	closeOrFail(t, c)
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Errorf("Unexpected error: %+v", err)
+	}
+}
+
+func testDialWithBackoffTimeout(t *testing.T) {
 	// Make the test short.
 	bo := backOffTemplate
 	bo.Steps = 2
 
-	// Timeout. Use special testing IP address.
-	c, err = dialBackOffHelper(context.Background(), "tcp4", "198.18.0.254:8888", bo, sleepTO)
+	// Timeout. Use non-routable IP. See: https://stackoverflow.com/a/31581323/844449
+	c, err := dialBackOffHelper(
+		context.Background(), "tcp4", "10.0.0.0:81", bo, sleepTO)
 	if err == nil {
-		c.Close()
+		closeOrFail(t, c)
 		t.Error("Unexpected success dialing")
 	}
-	const expectedErrPrefix = "timed out dialing"
-	if err == nil || !strings.HasPrefix(err.Error(), expectedErrPrefix) {
-		t.Errorf("Error = %v, want: %s(...)", err, expectedErrPrefix)
+	if !errors.Is(err, ErrTimeoutDialing) {
+		t.Errorf("Unexpected error: %+v", err)
 	}
+}
 
+func testDialWithBackoffSuccess(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer s.Close()
+	addr := strings.TrimPrefix(s.URL, HTTPPrefix)
 
-	c, err = DialWithBackOff(context.Background(), "tcp4", strings.TrimPrefix(s.URL, "http://"))
+	c, err := DialWithBackOff(context.Background(), "tcp4", addr)
 	if err != nil {
 		t.Fatal("Dial error =", err)
 	}
-	c.Close()
+	closeOrFail(t, c)
+}
+
+func closeOrFail(tb testing.TB, con io.Closer) {
+	tb.Helper()
+	if con == nil {
+		return
+	}
+	if err := con.Close(); err != nil {
+		tb.Fatal(err)
+	}
+}
+
+func findUnusedPortOrFail(tb testing.TB) int {
+	tb.Helper()
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	l, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer closeOrFail(tb, l)
+	return l.Addr().(*net.TCPAddr).Port
 }
