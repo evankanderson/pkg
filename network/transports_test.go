@@ -27,6 +27,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 )
@@ -77,6 +78,7 @@ func TestHTTPRoundTripper(t *testing.T) {
 const HTTPPrefix = "http://"
 
 func TestDialWithBackoff(t *testing.T) {
+	t.Parallel()
 	t.Run("ConnectionRefused", testDialWithBackoffConnectionRefused)
 	t.Run("Timeout", testDialWithBackoffTimeout)
 	t.Run("Success", testDialWithBackoffSuccess)
@@ -95,11 +97,12 @@ func testDialWithBackoffConnectionRefused(t *testing.T) {
 func testDialWithBackoffTimeout(t *testing.T) {
 	// Make the test short.
 	bo := backOffTemplate
-	bo.Steps = 2
+	bo.Steps = 1
+	bo.Duration = time.Millisecond
 
 	// Timeout. Use non-routable IP. See: https://stackoverflow.com/a/31581323/844449
 	c, err := dialBackOffHelper(
-		context.Background(), "tcp4", "10.0.0.0:81", bo, sleepTO)
+		context.Background(), "tcp4", "10.0.0.0:81", bo, bo.Duration)
 	if err == nil {
 		closeOrFail(t, c)
 		t.Error("Unexpected success dialing")
