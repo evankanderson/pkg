@@ -98,11 +98,25 @@ func testDialWithBackoffTimeout(t *testing.T) {
 	// Make the test short.
 	bo := backOffTemplate
 	bo.Steps = 1
-	bo.Duration = time.Millisecond
+	bo.Duration = 1 * time.Millisecond
+
+	// Golang doesn't allow us to set the backlog argument on syscall.Listen ourselves.
+	closer, addr, err := listenOne()
+	if err != nil {
+		t.Fatalf("Unable to listen on %s: %s", addr, err)
+	}
+	defer closer()
+	// Occupy the single listen backlog for the entire test.
+	c1, err := dialBackOffHelper(context.Background(), "tcp4", addr.String(), bo, bo.Duration)
+	if err != nil {
+		t.Fatal("Unable to occupy single backlog connection: ", err)
+	}
+	defer c1.Close()
+	// Since the backlog is full, the next request should time out.
 
 	// Timeout. Use non-routable IP. See: https://stackoverflow.com/a/31581323/844449
 	c, err := dialBackOffHelper(
-		context.Background(), "tcp4", "10.0.0.0:81", bo, bo.Duration)
+		context.Background(), "tcp4", addr.String() /*"10.0.0.0:81"*/, bo, bo.Duration)
 	if err == nil {
 		closeOrFail(t, c)
 		t.Error("Unexpected success dialing")
@@ -147,4 +161,35 @@ func findUnusedPortOrFail(tb testing.TB) int {
 	}
 	defer closeOrFail(tb, l)
 	return l.Addr().(*net.TCPAddr).Port
+}
+
+// Golang doesn't allow us to set the backlog argument on syscall.Listen from
+// net.ListenTCP, so we need to get directly into syscall land.
+func listenOne() (func(), *net.TCPAddr, error) {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Couldn't get socket: %w", err)
+	}
+	sa := &syscall.SockaddrInet4{
+		Port: 0,
+		Addr: [4]byte{127, 0, 0, 1},
+	}
+	if err = syscall.Bind(fd, sa); err != nil {
+		return nil, nil, fmt.Errorf("Unable to bind: %w", err)
+	}
+	if err = syscall.Listen(fd, 0); err != nil {
+		return nil, nil, fmt.Errorf("Unable to Listen: %w", err)
+	}
+	closer := func() { syscall.Close(fd) }
+	listenaddr, err := syscall.Getsockname(fd)
+	if err != nil {
+		closer()
+		return nil, nil, fmt.Errorf("Could not get sockname: %w", err)
+	}
+	sa = listenaddr.(*syscall.SockaddrInet4)
+	addr := &net.TCPAddr{
+		IP:   sa.Addr[:],
+		Port: sa.Port,
+	}
+	return closer, addr, nil
 }
